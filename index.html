@@ -108,6 +108,7 @@
       <button data-view="home" class="active">首頁</button>
       <button data-view="list">單字表</button>
       <button data-view="setup">開始測驗</button>
+      <button data-view="history">歷程記錄</button>
     </nav>
   </div>
 </header>
@@ -168,11 +169,38 @@
         </label>
         <label class="fld">題數
           <select id="setCount">
-            <option>10</option><option>15</option><option selected>20</option><option>30</option>
+            <option>10</option><option>15</option><option selected>20</option><option>30</option><option>50</option><option>70</option>
           </select>
         </label>
       </div>
       <button class="btn" id="startBtn">開始測驗 ▶</button>
+    </div>
+  </section>
+
+  <!-- HISTORY -->
+  <section id="view-history" class="hidden">
+    <div class="card">
+      <div class="qbar">
+        <h2 style="margin:0">評量歷程記錄</h2>
+        <span style="display:flex;gap:8px">
+          <button class="btn" id="exportHist">匯出 Excel (CSV)</button>
+          <button class="btn ghost" id="clearHist">清除全部紀錄</button>
+        </span>
+      </div>
+      <p class="muted">每次完成測驗會自動上傳到 Google 雲端試算表，依時間由新到舊排列，跨裝置共用。</p>
+      <div class="row" style="background:var(--soft);padding:12px;border-radius:10px">
+        <label class="fld" style="flex:1;min-width:260px">Google Apps Script 網址（Web App URL）
+          <input type="text" id="cloudUrlInput" placeholder="貼上 https://script.google.com/macros/s/.../exec">
+        </label>
+        <button class="btn" id="saveCloudUrl" style="align-self:flex-end">儲存設定</button>
+        <span class="muted" id="cloudHint" style="align-self:flex-end;font-size:.82rem">設定一次即可，網址會記在本機設定中</span>
+      </div>
+      <div style="overflow-x:auto">
+        <table>
+          <thead><tr><th>時間</th><th>班級</th><th>座號</th><th>姓名</th><th>題型</th><th>範圍</th><th>答對</th><th>分數</th></tr></thead>
+          <tbody id="histBody"></tbody>
+        </table>
+      </div>
     </div>
   </section>
 
@@ -258,8 +286,9 @@ if('speechSynthesis' in window){ speechSynthesis.onvoiceschanged = pickVoice; }
 
 /* ---------- view switching ---------- */
 function show(view){
-  ["home","list","setup","quiz","result"].forEach(v=>$("#view-"+v).classList.toggle("hidden",v!==view));
+  ["home","list","setup","quiz","result","history"].forEach(v=>$("#view-"+v).classList.toggle("hidden",v!==view));
   $$("nav button").forEach(b=>b.classList.toggle("active",b.dataset.view===view));
+  if(view==="history") renderHistory();
   window.scrollTo(0,0);
 }
 $$("nav button").forEach(b=>b.onclick=()=>show(b.dataset.view));
@@ -451,6 +480,12 @@ function finishQuiz(){
   const s=quiz.student||{};
   const who = s.name?`${s.cls}　座號 ${s.seat}　${s.name}　·　`:"";
   $("#resSummary").innerHTML=`${who}題型：${MODE_LABEL[quiz.mode]}　答對 ${quiz.score} / ${total} 題（每題 ${(100/total).toFixed(1)} 分）　${msg}<br><b style="color:${color};font-size:1.15rem">總分：${score} / 100 分</b>`;
+  // 寫入評量歷程
+  if(!quiz._saved){
+    quiz._saved=true;
+    addHistory({ t:Date.now(), cls:s.cls||"", seat:s.seat||"", name:s.name||"",
+      mode:quiz.mode, scope:scopeLabel(quiz.scope), correct:quiz.score, total:total, score:score });
+  }
   $("#reviewBody").innerHTML=quiz.log.map(l=>`
     <tr>
       <td class="no">${l.no}</td>
@@ -459,6 +494,85 @@ function finishQuiz(){
       <td>${l.answer}${l.answer!==l.en?` <span class="muted">(${l.en})</span>`:''}</td>
     </tr>`).join("");
 }
+
+/* ---------- 雲端歷程記錄 (Google Apps Script + 試算表) ---------- */
+const CFG_KEY="vocab_quiz_cloud_url";   // 僅儲存「設定網址」，成績資料存在雲端
+let cloudRows=[];
+function getCloudUrl(){ return (localStorage.getItem(CFG_KEY)||"").trim(); }
+function setCloudUrl(u){ localStorage.setItem(CFG_KEY,u.trim()); }
+function scopeLabel(scope){
+  if(scope==="all") return "全部 300 字";
+  const g=GROUPS.find(g=>g.id===+scope);
+  return g?`單元 ${g.id}：${g.title}`:scope;
+}
+// 以 JSONP 讀取雲端資料（避開跨來源限制）
+function jsonp(url){
+  return new Promise((resolve,reject)=>{
+    const cb="__vocabcb"+Date.now()+Math.floor(Math.random()*1000);
+    const s=document.createElement("script");
+    const timer=setTimeout(()=>{ cleanup(); reject(new Error("timeout")); },15000);
+    function cleanup(){ clearTimeout(timer); delete window[cb]; s.remove(); }
+    window[cb]=data=>{ cleanup(); resolve(data); };
+    s.onerror=()=>{ cleanup(); reject(new Error("load error")); };
+    s.src=url+(url.includes("?")?"&":"?")+"callback="+cb+"&_="+Date.now();
+    document.body.appendChild(s);
+  });
+}
+// 上傳一筆成績（fire-and-forget）
+function addHistory(rec){
+  const url=getCloudUrl();
+  if(!url){ alert("尚未設定 Google 雲端網址，本次成績未上傳。請到「歷程記錄」頁設定。"); return; }
+  fetch(url,{method:"POST",mode:"no-cors",headers:{"Content-Type":"text/plain;charset=utf-8"},body:JSON.stringify(rec)}).catch(()=>{});
+}
+function histRowHtml(r){
+  const d=new Date(Number(r.t));
+  const pad=n=>String(n).padStart(2,"0");
+  const ts=`${d.getFullYear()}/${pad(d.getMonth()+1)}/${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  const color=r.score>=80?"var(--ok)":r.score>=60?"var(--warn)":"var(--bad)";
+  return `<tr>
+    <td>${ts}</td><td>${r.cls}</td><td>${r.seat}</td><td>${r.name}</td>
+    <td>${MODE_LABEL[r.mode]||r.mode}</td><td style="font-size:.85rem">${r.scope}</td>
+    <td>${r.correct}/${r.total}</td>
+    <td style="font-weight:800;color:${color}">${r.score}</td></tr>`;
+}
+function renderHistory(){
+  const tb=$("#histBody");
+  $("#cloudUrlInput").value=getCloudUrl();
+  const url=getCloudUrl();
+  const msg=t=>tb.innerHTML=`<tr><td colspan="8" class="muted" style="text-align:center;padding:18px">${t}</td></tr>`;
+  if(!url){ msg("請先在上方貼上 Google Apps Script 網址並按「儲存設定」"); return; }
+  msg("讀取雲端資料中…");
+  jsonp(url).then(rows=>{
+    cloudRows=(Array.isArray(rows)?rows:[]).slice().sort((a,b)=>Number(b.t)-Number(a.t));
+    if(!cloudRows.length){ msg("尚無評量紀錄"); return; }
+    tb.innerHTML=cloudRows.map(histRowHtml).join("");
+  }).catch(()=>msg("讀取失敗，請確認網址正確、已部署為 Web App，且存取權設為「任何人」。"));
+}
+$("#saveCloudUrl").onclick=()=>{ setCloudUrl($("#cloudUrlInput").value); renderHistory(); };
+$("#clearHist").onclick=()=>{
+  const url=getCloudUrl();
+  if(!url){ alert("尚未設定雲端網址"); return; }
+  if(confirm("確定要清除雲端的全部評量紀錄嗎？此動作無法復原。")){
+    jsonp(url+(url.includes("?")?"&":"?")+"action=clear").then(()=>renderHistory()).catch(()=>alert("清除失敗，請稍後再試"));
+  }
+};
+$("#exportHist").onclick=()=>{
+  const arr=cloudRows.slice();
+  if(!arr.length){ alert("目前沒有可匯出的紀錄（請先讀取雲端資料）"); return; }
+  const pad=n=>String(n).padStart(2,"0");
+  const fmt=t=>{const d=new Date(t);return `${d.getFullYear()}/${pad(d.getMonth()+1)}/${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;};
+  const esc=v=>`"${String(v==null?"":v).replace(/"/g,'""')}"`;
+  const head=["時間","班級","座號","姓名","題型","範圍","答對","總題數","分數"];
+  const rows=arr.map(r=>[fmt(r.t),r.cls,r.seat,r.name,MODE_LABEL[r.mode]||r.mode,r.scope,r.correct,r.total,r.score]);
+  const csv=[head,...rows].map(row=>row.map(esc).join(",")).join("\r\n");
+  const blob=new Blob(["﻿"+csv],{type:"text/csv;charset=utf-8;"}); // BOM 讓 Excel 正確顯示中文
+  const d=new Date();
+  const fname=`評量歷程_${d.getFullYear()}${pad(d.getMonth()+1)}${pad(d.getDate())}.csv`;
+  const a=document.createElement("a");
+  a.href=URL.createObjectURL(blob); a.download=fname;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(()=>URL.revokeObjectURL(a.href),1000);
+};
 
 $("#startBtn").onclick=()=>{
   const stu={cls:$("#stClass").value.trim(),seat:$("#stSeat").value.trim(),name:$("#stName").value.trim()};
